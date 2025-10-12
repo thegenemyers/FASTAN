@@ -31,14 +31,18 @@
  *
  ********************************************************************************************/
 
+//  If the genome/sequence is masked then it must be upper-case (i.e. u-line is present)
+
 static char *gdbSchemaText =
-  "1 3 def 1 0                 schema for genome skeleton\n"
+  "1 3 def 1 0                         schema for genome skeleton\n"
   ".\n"
-  "P 3 gdb                     GDB\n"
+  "P 3 gdb                             GDB\n"
   "D f 4 4 REAL 4 REAL 4 REAL 4 REAL   global: base frequency vector\n"
-  "O S 1 6 STRING              id for a scaffold\n"
-  "D G 1 3 INT                 gap of given length\n"
-  "D C 1 3 INT                 contig of given length\n"
+  "D u 0                               global: upper case when displayed\n"
+  "O S 1 6 STRING                      id for a scaffold\n"
+  "D G 1 3 INT                         gap of given length\n"
+  "D C 1 3 INT                         contig of given length\n"
+  "D M 1 8 INT_LIST                    mask pair list for a contig\n"
 ;
 
 static OneSchema *make_GDB_Schema()
@@ -48,11 +52,13 @@ static char *seqSchemaText =
   "1 3 def 1 0                 schema for aln and FastGA\n"
   ".\n"
   "P 3 seq                     SEQUENCE\n"
+  "D u 0                       global: upper case when displayed\n"
   "O s 2 3 INT 6 STRING        length and id for group of sequences = a scaffold\n"
   "G S                         scaffolds (s) group sequence objects (S)\n"
   "D n 2 4 CHAR 3 INT          non-acgt chars outside (between) sequences within scaffold\n"
   "O S 1 3 DNA                 sequence\n"
   "D I 1 6 STRING              identifier of sequence\n"
+  "D M 1 8 INT_LIST            soft-mask list for a sequence\n"
 ;
 
 OneSchema *make_Seq_Schema()
@@ -280,7 +286,7 @@ int Get_GDB_Paths(char *source, char *target, char **spath, char **tpath, int no
     }
   else // argc == 3
     { TPATH = target;
-      if (stat(TPATH,&status) >= 0 && (status.st_mode & S_IFMT) != S_IFDIR)
+      if (stat(TPATH,&status) >= 0 && (status.st_mode & S_IFMT) == S_IFDIR)
         TROOT = SROOT;
       else
         { p = rindex(TPATH,'/');
@@ -433,32 +439,44 @@ static char *read_line(void *input, int gzipd, int *plen, int nline, char *spath
   return (buffer);
 }
 
-FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
+FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath, int nthresh)
 { GDB_SCAFFOLD  *scaffs;
   GDB_CONTIG    *contigs;
+  GDB_MASK      *masks;
   OneProvenance *prov;
   char          *headers, *seqpath;
   int            ctgtop, scftop;
-  int64          hdrtop;
+  int64          hdrtop, msktop;
   int64          count[4];
   FILE          *bases;
   int64          hdrtot, maxctg, seqtot, boff;
-  int            ncontig, nscaff, nprov;
+  int            ncontig, nscaff, nmasks, nprov;
   int            len, clen;
   int64          spos;
 
-  int            gzipd, nline;
+  int            gzipd, nline, has_mask;
   void          *input;
-
   OneSchema     *schema;
   OneFile       *of;
+
+  prov  = NULL;
+  input  = NULL;
+  schema = NULL;
+  of     = NULL;
 
   //  Establish .bps file if needed
 
   bases = NULL;
   if (bps != 0)
     { if (tpath == NULL)
-        seqpath = Numbered_Suffix("._gdb.",getpid(),".bps");
+        { seqpath = Numbered_Suffix("._gdb.",getpid(),".bps.XXXXXX");
+          int fd = mkstemp(seqpath);
+          if (fd == -1)
+            { free(seqpath);
+              EXIT (NULL);
+            }
+          close(fd);
+        }
       else
         { char *path = PathTo(tpath);
           char *root = Root(tpath,".1gdb");
@@ -473,21 +491,28 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
         }
       if (seqpath == NULL)
         EXIT (NULL);
+      seqpath = strdup(seqpath);
+      if (seqpath == NULL)
+        EXIT(NULL);
       bases = Fopen(seqpath,"w+");
       if (bases == NULL)
-        EXIT(NULL);
+        { free(seqpath);
+          EXIT(NULL);
+        }
     }
   else
-    seqpath = "";
+    seqpath = NULL;
 
   //  Setup expanding arrays for headers, scaffolds, & contigs
 
-  hdrtot  = 0;
-  maxctg  = 0;
-  ncontig = 0;
-  nscaff  = 0;
-  seqtot  = 0;
-  boff    = 0;
+  hdrtot   = 0;
+  maxctg   = 0;
+  ncontig  = 0;
+  nscaff   = 0;
+  nmasks   = 0;
+  seqtot   = 0;
+  boff     = 0;
+  has_mask = 0;
 
   count[0] = 0;
   count[1] = 0;
@@ -497,35 +522,42 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
   hdrtop  = 100000;
   ctgtop  = 5000;
   scftop  = 1000;
-  contigs = malloc(ctgtop*sizeof(GDB_CONTIG));
+  msktop  = 50000;
+  contigs = malloc((ctgtop+1)*sizeof(GDB_CONTIG));
   scaffs  = malloc(scftop*sizeof(GDB_CONTIG));
   headers = malloc(hdrtop);
-  gdb->srcpath = strdup(spath);
-  if (contigs == NULL || scaffs == NULL || headers == NULL || gdb->srcpath == NULL)
+  masks   = malloc((msktop+1)*sizeof(GDB_MASK));
+  if (*spath != '/')
+    gdb->srcpath = strdup(MyCatenate(getcwd(NULL,0),"/",spath,""));
+  else
+    gdb->srcpath = strdup(spath);
+  if (contigs == NULL || scaffs == NULL || headers == NULL || masks == NULL || gdb->srcpath == NULL)
     { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
-      goto error1;
+      goto error;
     }
 
   //  Read either 1-file or fasta and accumulate skeleton
 
   if (ftype == IS_ONE)
 
-    { int   i, isScaffold;
-      int   byte_cnt[256];     // times byte occurs in compressed sequence
-      int   psize;
-      char *pstr;
+    { int    i, isScaffold;
+      int    byte_cnt[256];     // times byte occurs in compressed sequence
+      int64  scount, Icount, ncount;
+      int64 *list;
+      int    psize;
+      char  *pstr;
 
       schema = make_Seq_Schema();
       if (schema == NULL)
         { EPRINTF(EPLACE,"%s: Failed to create onecode schema (Create_GDB)\n",Prog_Name);
-          goto error1;
+          goto error;
         }
 
       of = oneFileOpenRead (spath, schema, "seq", 1) ;
       if (of == NULL)
         { EPRINTF(EPLACE,"%s: Cannot open %s as a 1-code sequence file (Create_GDB)\n",
                          Prog_Name,spath);
-          goto error3;
+          goto error;
         }
     
       for (i = 0; i < 256; i++)
@@ -542,7 +574,7 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
       if (psize > 0)
         { prov = malloc(psize);
           if (prov == NULL)
-            goto error4;
+            goto error;
 
           pstr = (char *) (prov + nprov);
           for (i = 0; i < nprov; i++)
@@ -564,18 +596,21 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
       //   - straight sequence files with no s and n lines, and only S lines, allowing I lines
     
       // Ignore N characters in sequences (non-acgt chars within contigs)
+
+      oneStats(of,'s',&scount,NULL,NULL);
+      oneStats(of,'I',&Icount,NULL,NULL);
+      oneStats(of,'n',&ncount,NULL,NULL);
     
-      if (of->info['s']->given.count > 0 && of->info['I']->given.count == 0)
+      if (scount > 0 && Icount == 0)
         isScaffold = true;
-      else if (of->info['s']->given.count == 0 && of->info['n']->given.count == 0)
+      else if (scount == 0 && ncount == 0)
         isScaffold = false;
       else
         { EPRINTF(EPLACE,"%s: 1seq file %s has incomplete scaffold properties - can't use it\n",
                          Prog_Name,spath);
           EPRINTF(EPLACE,"          I.E. #'s' = %lld  #'I' = %lld  #'n' = %lld\n",
-                   of->info['s']->given.count, of->info['I']->given.count,
-                   of->info['n']->given.count) ;
-          goto error4;
+                   scount,Icount,ncount) ;
+          goto error;
         }
     
       spos = 0;
@@ -593,7 +628,7 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
                 scaffs = realloc(scaffs,scftop*sizeof(GDB_SCAFFOLD));
                 if (scaffs == NULL)
                   { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
-                    goto error4;
+                    goto error;
                   }
               }
             scaffs[nscaff].hoff = hdrtot;
@@ -601,7 +636,15 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
             spos = 0;
     
             len = oneLen(of);
-            memmove(headers+hdrtot,oneString(of),len);
+            if (hdrtot + len + 1 > hdrtop)
+              { hdrtop = 1.2*(hdrtot+len+1) + 10000;
+                headers = realloc(headers,hdrtop);
+                if (headers == NULL)
+                  { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
+                    goto error;
+                  }
+              }
+            memcpy(headers+hdrtot,oneString(of),len);
             hdrtot += len;
             headers[hdrtot++] = '\0';
             break;
@@ -609,19 +652,24 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
           case 'n': // non-acgt chars outside sequences
             spos += oneInt(of,1);
             break;
+
+          case 'u': // caps indicator
+            has_mask = 1;
+            break;
     
           case 'S': // sequence object
             len = oneLen(of);
     
             if (ncontig >= ctgtop)
               { ctgtop = 1.2*ncontig + 1000;
-                contigs = realloc(contigs,ctgtop*sizeof(GDB_CONTIG));
+                contigs = realloc(contigs,(ctgtop+1)*sizeof(GDB_CONTIG));
                 if (contigs == NULL)
                   { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
-                    goto error4;
+                    goto error;
                   }
               }
             contigs[ncontig].boff = boff;
+            contigs[ncontig].moff = nmasks;
             contigs[ncontig].clen = len;
             contigs[ncontig].sbeg = spos;
             contigs[ncontig].scaf = nscaff;
@@ -640,12 +688,34 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
     
             if (bps)
               { if (fwrite (bytes, clen, 1, bases) != 1)
-                  goto error4;
+                  goto error;
               }
             boff += clen;
     
             if (isScaffold)
               spos += len;
+            break;
+
+          case 'M':
+            len = oneLen(of);
+
+            if (nmasks + len/2 >= msktop)
+              { msktop = 1.2*(nmasks+len/2) + 1000;
+                masks  = realloc(masks,(msktop+1)*sizeof(GDB_MASK));
+                if (masks == NULL)
+                  { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
+                    goto error;
+                  }
+              }
+            has_mask = 1;
+
+            list = oneIntList(of);
+
+            for (i = 0; i < len; i += 2)
+              { masks[nmasks].beg = list[i];
+                masks[nmasks].end = list[i+1];
+                nmasks += 1;
+              }
             break;
     
           case 'I': // identifier of sequence
@@ -659,7 +729,15 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
             spos = 0;
     
             len = oneLen(of);
-            memmove(headers+hdrtot,oneString(of),len);
+            if (hdrtot + len + 1 > hdrtop)
+              { hdrtop = 1.2*(hdrtot+len+1) + 10000;
+                headers = realloc(headers,hdrtop);
+                if (headers == NULL)
+                  { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
+                    goto error;
+                  }
+              }
+            memcpy(headers+hdrtot,oneString(of),len);
             hdrtot += len;
             headers[hdrtot++] = '\0';
             break;
@@ -686,7 +764,10 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
     { char          bpsbuf[1024];
       int           bpscur;
       char         *line;
-      int           i, x, m, in;
+      int64         bpos, mpos, mask;
+      int           nin, lastn;
+      int           boc, eoc;
+      int           s, x, m;
       uint8         byte;
 
       byte    = 0;
@@ -699,7 +780,7 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
         input = fopen(spath,"r");
       if (input == NULL)
         { EPRINTF(EPLACE,"%s: Cannot open %s for reading\n",Prog_Name,spath);
-          goto error1;
+          goto error;
         }
 
       nprov = 0;
@@ -710,30 +791,30 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
       nline = 1;
       line  = read_line(input,gzipd,&len,nline,spath);
       if (line == ERROR)
-        goto error2;
+        goto error;
       else if (line == NULL)
         { EPRINTF(EPLACE,"%s: Input %s is empty, terminating!\n",Prog_Name,spath);
-          goto error2;
+          goto error;
         }
     
       if (line[0] != '>')
         { EPRINTF(EPLACE,"%s: First header in fasta file %s is missing\n",
                          Prog_Name,spath);
-          goto error2;
+          goto error;
         }
     
       while (line != NULL)
-        { for (i = 1; i < len; i++)
-            if (!isspace(line[i]))
+        { for (s = 1; s < len; s++)
+            if (!isspace(line[s]))
               break;
-          len -= i;
+          len -= s;
     
           if (nscaff >= scftop)
             { scftop = 1.2*nscaff + 500;
               scaffs = realloc(scaffs,scftop*sizeof(GDB_SCAFFOLD));
               if (scaffs == NULL)
                 { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
-                  goto error2;
+                  goto error;
                 }
             }
           scaffs[nscaff].fctg = ncontig;
@@ -741,27 +822,73 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
     
           if (hdrtot + len + 1 > hdrtop)
             { hdrtop = 1.2*(hdrtot+len+1) + 10000;
-              headers = realloc(headers,hdrtot);
+              headers = realloc(headers,hdrtop);
               if (headers == NULL)
                 { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",Prog_Name,spath);
-                  goto error2;
+                  goto error;
                 }
             }
-          memcpy(headers+hdrtot,line+i,len);
+          memcpy(headers+hdrtot,line+s,len);
           hdrtot += len;
           headers[hdrtot++] = '\0';
-    
-          in   = 0;
+
+          mask = -1;
           spos = 0;
+          clen = 0;
+          bpos = boff;
+          mpos = nmasks;
+          m    = 0;
+          lastn = 0;
           while (1)
             { nline += 1;
-              line   = read_line(input,gzipd,&len,nline,spath);
+              line = read_line(input,gzipd,&len,nline,spath);
               if (line == ERROR)
-                goto error2;
+                goto error;
               else if (line == NULL || line[0] == '>')
-                { if (in)
-                    { if (bps)
-                        { if ((clen & 0x7) != 0)
+                { nin = nthresh + 1;
+                  s   = -1;
+                }
+              else
+                { for (nin = 0; nin < len; nin++)
+                    if (number[(int) line[nin]] < 4)
+                      break;
+                  if (nin == len)
+                    { lastn += nin;
+                      continue;
+                    }
+                  s = nin;
+                  nin += lastn;
+
+                  lastn = 1; 
+                  while (number[(int) line[len-lastn]] >= 4)
+                    lastn += 1;
+                  lastn -= 1;
+                  len   -= lastn;
+                }
+
+              while (s < len)
+                { if (nin > 0)
+                    { if (nin < nthresh)
+                        { if (bps)
+                            for (x = nin; x > 0; x--)
+                              { if (m == 6)
+                                  { if (bpscur >= 1024)
+                                      { fwrite(bpsbuf,1024,1,bases);
+                                        bpscur = 0;
+                                      }
+                                    bpsbuf[bpscur++] = byte;
+                                    boff += 1;
+                                    m = 0;
+                                    byte = 0;
+                                  }
+                                else
+                                  m += 2;
+                              }
+                          clen += nin;
+                          count[0] += nin;
+                        }
+                      else
+                        { if (m > 0)
                             { if (bpscur >= 1024)
                                 { fwrite(bpsbuf,1024,1,bases);
                                   bpscur = 0;
@@ -769,133 +896,133 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
                               bpsbuf[bpscur++] = byte;
                               boff += 1;
                             }
-                          clen >>= 1;
-                        }
-                      spos += clen;
-                      contigs[ncontig].clen = clen;
-                      seqtot += clen;
-                      if (clen > maxctg)
-                        maxctg = clen;
-                      ncontig += 1;
-                      if (ncontig >= ctgtop)
-                        { ctgtop = 1.2*ncontig + 1000;
-                          contigs = realloc(contigs,ctgtop*sizeof(GDB_CONTIG));
-                          if (contigs == NULL)
-                            { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",
-                                             Prog_Name,spath);
-                              goto error2;
+                          byte = 0;
+                          m = 0;
+
+                          if (mask >= 0)
+                            { if (nmasks >= msktop)
+                                { msktop = 1.2*nmasks + 1000;
+                                  masks  = realloc(masks,(msktop+1)*sizeof(GDB_MASK));
+                                  if (masks == NULL)
+                                    { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",
+                                                     Prog_Name,spath);
+                                      goto error;
+                                    }
+                                }
+                              masks[nmasks].beg = mask;
+                              masks[nmasks].end = clen; 
+                              nmasks += 1;
+                              if (mask > 0)
+                                has_mask = 1;
+                              mask = -1;
                             }
+  
+                          if (ncontig >= ctgtop)
+                            { ctgtop = 1.2*ncontig + 1000;
+                              contigs = realloc(contigs,(ctgtop+1)*sizeof(GDB_CONTIG));
+                              if (contigs == NULL)
+                                { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",
+                                                 Prog_Name,spath);
+                                  goto error;
+                                }
+                            }
+                          contigs[ncontig].clen = clen;
+                          contigs[ncontig].sbeg = spos;
+                          contigs[ncontig].boff = bpos;
+                          contigs[ncontig].moff = mpos;
+                          contigs[ncontig].scaf = nscaff;
+                          ncontig += 1;
+
+                          if (clen > maxctg)
+                            maxctg = clen;
+
+                          if (s < 0)    //  At end of scaffold
+                            { spos += clen;
+                              goto eos;
+                            }
+
+                          spos += clen + nin;
+                          bpos  = boff;
+                          mpos  = nmasks;
+                          clen  = 0;
                         }
                     }
-                  break;
-                }
-    
-              if (bps)
-                for (i = 0; i < len; i++)
-                  { x = number[(int) line[i]];
-                    if (x < 4)
-                      { if (!in)
-                          { if (ncontig >= ctgtop)
-                              { ctgtop = 1.2*ncontig + 1000;
-                                contigs = realloc(contigs,ctgtop*sizeof(GDB_CONTIG));
-                                if (contigs == NULL)
-                                  { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",
-                                                   Prog_Name,spath);
-                                    goto error2;
-                                  }
+
+                  if (bps)
+                    for (boc = s; s < len; s++)
+                      { if ((x = number[(int) line[s]]) >= 4) 
+                          break;
+                        byte |= (x << m);
+                        if (m == 6)
+                          { if (bpscur >= 1024)
+                              { fwrite(bpsbuf,1024,1,bases);
+                                bpscur = 0;
                               }
-                            contigs[ncontig].sbeg = spos;
-                            contigs[ncontig].boff = boff;
-                            contigs[ncontig].scaf = nscaff;
-                            clen = 0;
-                            in   = 1;
+                            bpsbuf[bpscur++] = byte;
+                            boff += 1;
+                            m = 0;
+                            byte = 0;
                           }
-                        count[x] += 1;
-                        m = (clen & 0x7);
-                        if (m == 0)
-                          byte = x;
                         else
-                          { byte |= (x << m);
-                            if (m == 6)
-                              { if (bpscur >= 1024)
-                                  { fwrite(bpsbuf,1024,1,bases);
-                                    bpscur = 0;
-                                  }
-                                bpsbuf[bpscur++] = byte;
-                                boff += 1;
-                              }
-                          }
-                        clen += 2;
-                      }
-                    else
-                      { if (in)
-                          { if ((clen & 0x7) != 0)
-                              { if (bpscur >= 1024)
-                                  { fwrite(bpsbuf,1024,1,bases);
-                                    bpscur = 0;
-                                  }
-                                bpsbuf[bpscur++] = byte;
-                                boff += 1;
-                               }
-                            clen >>= 1;
-                            spos += clen;
-                            contigs[ncontig].clen = clen;
-                            seqtot += clen;
-                            if (clen > maxctg)
-                              maxctg = clen;
-                            ncontig += 1;
-                            in = 0;
-                          }
-                        spos += 1;
-                      }
-                  }
-              else
-                for (i = 0; i < len; i++)
-                  { x = number[(int) line[i]];
-                    if (x < 4)
-                      { if (!in)
-                          { if (ncontig >= ctgtop)
-                              { ctgtop = 1.2*ncontig + 1000;
-                                contigs = realloc(contigs,ctgtop*sizeof(GDB_CONTIG));
-                                if (contigs == NULL)
-                                  { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",
-                                                   Prog_Name,spath);
-                                    goto error2;
-                                  }
-                              }
-                            contigs[ncontig].sbeg = spos;
-                            contigs[ncontig].boff = boff;
-                            contigs[ncontig].scaf = nscaff;
-                            clen = 0;
-                            in   = 1;
-                          }
+                          m += 2;
                         count[x] += 1;
-                        clen += 1;
                       }
-                    else
-                      { if (in)
-                          { spos += clen;
-                            contigs[ncontig].clen = clen;
-                            seqtot += clen;
-                            if (clen > maxctg)
-                              maxctg = clen;
-                            ncontig += 1;
-                            in = 0;
-                          }
-                        spos += 1;
+                  else
+                    for (boc = s; s < len; s++)
+                      { if ((x = number[(int) line[s]]) >= 4) 
+                          break;
+                        count[x] += 1;
                       }
-                  }
+                  eoc = s;
+
+                  for (s = boc; s < eoc; s++)
+                    { if (line[s] < 96)
+                        { if (mask >= 0)
+                            { if (nmasks >= msktop)
+                                { msktop = 1.2*nmasks + 1000;
+                                  masks  = realloc(masks,(msktop+1)*sizeof(GDB_MASK));
+                                  if (masks == NULL)
+                                    { EPRINTF(EPLACE,"%s: Out of memory creating GDB for %s\n",
+                                                     Prog_Name,spath);
+                                      goto error;
+                                    }
+                                }
+                              masks[nmasks].beg = mask;
+                              masks[nmasks].end = clen + (s-boc); 
+                              nmasks += 1;
+                              if (mask > 0)
+                                has_mask = 1;
+                              mask = -1;
+                            }
+                        }
+                      else
+                        { if (mask < 0)
+                            mask = clen + (s-boc);
+                        }
+                    }
+                  clen += eoc-boc;
+
+                  if (s < len)
+                    { nin = s;
+                      for (s++; number[(int) line[s]] >= 4; s++)
+                        ;
+                      nin = s-nin;
+                    }
+                }
             }
     
+        eos:
           if (spos == 0)
             { EPRINTF(EPLACE,"%s: Missing sequence entry at line %d in file %s\n",
                              Prog_Name,nline,spath);
-              goto error2;
+              goto error;
             }
           scaffs[nscaff].slen = spos;
           scaffs[nscaff].ectg = ncontig;
           nscaff += 1;
         }
+
+      seqtot = count[0] + count[1] + count[2] + count[3];
     
       if (bpscur > 0)
         fwrite(bpsbuf,bpscur,1,bases);
@@ -909,41 +1036,60 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
   if (bps > 0)
     rewind(bases);
 
+  contigs[ncontig].boff = boff;
+  contigs[ncontig].moff = nmasks;
+
+  gdb->iscaps = (nmasks == 0 || has_mask);
+  if (nmasks == 0 || !has_mask)
+    { int r;
+
+      if (nmasks > 0)
+        { for (r = 0; r < ncontig; r++)
+            contigs[r].moff = 0;
+        }
+      nmasks = 0;
+      free(masks);
+      masks = NULL;
+    }
+  else
+    masks = realloc(masks,(nmasks+1)*sizeof(GDB_MASK));
+
   gdb->nprov = nprov;
   gdb->prov  = prov;
 
   gdb->nscaff  = nscaff;
   gdb->ncontig = ncontig;
+  gdb->nmasks  = nmasks;
   gdb->maxctg  = maxctg;
   gdb->hdrtot  = hdrtot;
   gdb->seqtot  = seqtot;
 
-  gdb->scaffolds = scaffs;
-  gdb->contigs   = contigs;
-  gdb->headers   = headers;
+  gdb->scaffolds = realloc(scaffs,nscaff*sizeof(GDB_SCAFFOLD));
+  gdb->contigs   = realloc(contigs,(ncontig+1)*sizeof(GDB_CONTIG));
+  gdb->masks     = masks;
+  gdb->headers   = realloc(headers,hdrtot);
   gdb->seqstate  = EXTERNAL;
   gdb->seqsrc    = ftype;
-  gdb->seqpath   = Strdup(seqpath,"Allocating GDB sequence file name (Create_GDB)");
-  if (gdb->seqpath == NULL)
-    goto error1; 
-  gdb->seqs = bases;
+  gdb->seqpath   = seqpath;
+  gdb->seqs      = bases;
 
   gdb->freq[0] = (1.*count[0])/seqtot;
   gdb->freq[1] = (1.*count[1])/seqtot;
   gdb->freq[2] = (1.*count[2])/seqtot;
   gdb->freq[3] = (1.*count[3])/seqtot;
 
-  if (bps == 0)
-    return ((FILE **) &gdb->seqs);
+  if (bps <= 1)
+    { if (bps == 1 && tpath == NULL)
+        unlink(seqpath);
+      return ((FILE **) &gdb->seqs);
+    }
   else
     { FILE **units;
       int    i;
 
       units = malloc(sizeof(FILE *)*bps);
       if (units == NULL)
-        { free(gdb->seqpath);
-          goto error1;
-        }
+        goto error;
       units[0] = bases;
       for (i = 1; i < bps; i++)
         units[i] = Fopen(seqpath,"r");
@@ -952,25 +1098,28 @@ FILE **Create_GDB(GDB *gdb, char *spath, int ftype, int bps, char *tpath)
       return (units);
     }
 
-error4:
-  oneFileClose(of);
-error3:
-  oneSchemaDestroy(schema);
-  goto error1;
-error2:
-  if (gzipd)
-    gzclose(input);
-  else
-    fclose(input);
-error1:
+error:
+  if (of != NULL)
+    oneFileClose(of);
+  if (schema != NULL)
+    oneSchemaDestroy(schema);
+  if (input != NULL)
+    { if (gzipd)
+        gzclose(input);
+      else
+        fclose(input);
+    }
+  free(prov);
   free(gdb->srcpath);
   free(headers);
   free(scaffs);
   free(contigs);
+  free(masks);
   if (bases != NULL)
     fclose(bases);
   if (tpath == NULL)
     unlink(seqpath);
+  free(seqpath);
   EXIT (NULL);
 }
 
@@ -992,10 +1141,11 @@ int Read_GDB(GDB *gdb, char *path)
   FILE          *seqs;
   GDB_SCAFFOLD  *scf;
   GDB_CONTIG    *ctg;
+  GDB_MASK      *msk;
   OneProvenance *prov;
   char          *hdr, *srcpath, *seqpath;
-  int            nscaff, ncontig, nprov;
-  int64          len, seqtot, hdrtot, maxctg, boff, spos, psize;
+  int64          nscaff, ncontig, nprov, nmasks;
+  int64          len, seqtot, hdrtot, maxctg, boff, spos, psize, iscaps;
 
   { char *e;
     char *root, *pwd;
@@ -1065,10 +1215,12 @@ int Read_GDB(GDB *gdb, char *path)
       }
   }
 
-  nprov   = of->info['!']->accum.count;
-  nscaff  = of->info['S']->given.count;
-  ncontig = of->info['C']->given.count;
-  hdrtot  = of->info['S']->given.total + nscaff;
+  oneStats(of,'!',&nprov,NULL,NULL);
+  oneStats(of,'S',&nscaff,NULL,&hdrtot);
+  oneStats(of,'C',&ncontig,NULL,NULL);
+  oneStats(of,'M',NULL,NULL,&nmasks);
+  hdrtot += nscaff;
+  nmasks /= 2;
 
   { int i;
 
@@ -1083,7 +1235,11 @@ int Read_GDB(GDB *gdb, char *path)
   seqpath = strdup(seqpath);
   srcpath = strdup(of->reference[0].filename);
   scf   = malloc(sizeof(GDB_SCAFFOLD)*nscaff);
-  ctg   = malloc(sizeof(GDB_CONTIG)*ncontig);
+  ctg   = malloc(sizeof(GDB_CONTIG)*(ncontig+1));
+  if (nmasks > 0)
+    msk = malloc(sizeof(GDB_MASK)*(nmasks+1));
+  else
+    msk = NULL;
   hdr   = malloc(hdrtot);
   if (psize > 0)
     prov  = malloc(psize);
@@ -1113,9 +1269,11 @@ int Read_GDB(GDB *gdb, char *path)
 
   nscaff  = -1;
   ncontig = 0;
+  nmasks  = 0;
   hdrtot  = 0;
   seqtot  = 0;
   maxctg  = 0;
+  iscaps  = 0;
   boff = 0;
   spos = 0;
   while (oneReadLine(of))
@@ -1125,6 +1283,9 @@ int Read_GDB(GDB *gdb, char *path)
         gdb->freq[1] = oneReal(of,1);
         gdb->freq[2] = oneReal(of,2);
         gdb->freq[3] = oneReal(of,3);
+        break;
+      case 'u':
+        iscaps = 1;
         break;
       case 'S':
         if (nscaff >= 0)
@@ -1136,7 +1297,7 @@ int Read_GDB(GDB *gdb, char *path)
         scf[nscaff].hoff = hdrtot;
         scf[nscaff].fctg = ncontig;
         len = oneLen(of);
-        memmove(hdr+hdrtot,oneString(of),len);
+        memcpy(hdr+hdrtot,oneString(of),len);
         hdrtot += len;
         hdr[hdrtot++] = '\0';
         break;
@@ -1146,6 +1307,7 @@ int Read_GDB(GDB *gdb, char *path)
       case 'C':
         len = oneInt(of,0);
         ctg[ncontig].boff = boff;
+        ctg[ncontig].moff = nmasks;
         ctg[ncontig].sbeg = spos;
         ctg[ncontig].clen = len;
         ctg[ncontig].scaf = nscaff;
@@ -1156,10 +1318,27 @@ int Read_GDB(GDB *gdb, char *path)
         boff    += COMPRESSED_LEN(len);
         spos    += len;
         break;
+      case 'M':
+        { int    i;
+          int64 *list;
+
+          len  = oneInt(of,0);
+          list = oneIntList(of);
+          for (i = 0; i < len; i += 2)
+            { msk[nmasks].beg = list[i];
+              msk[nmasks].end = list[i+1];
+              nmasks += 1;
+            }
+          iscaps = 1;
+        }
+        break;
     }
   scf[nscaff].ectg = ncontig;
   scf[nscaff].slen = spos;
   nscaff += 1;
+
+  ctg[ncontig].moff = nmasks;
+  ctg[ncontig].boff = ctg[ncontig-1].boff + COMPRESSED_LEN(ctg[ncontig-1].clen);
 
   gdb->nprov = nprov;
   gdb->prov  = prov;
@@ -1170,6 +1349,10 @@ int Read_GDB(GDB *gdb, char *path)
   gdb->ncontig = ncontig;
   gdb->maxctg  = maxctg;
   gdb->contigs = ctg;
+
+  gdb->iscaps  = iscaps;
+  gdb->nmasks  = nmasks;
+  gdb->masks   = msk;
 
   gdb->srcpath  = srcpath;
   gdb->seqpath  = seqpath;
@@ -1201,6 +1384,7 @@ error:
   free(hdr);
   free(ctg);
   free(scf);
+  free(msk);
   free(srcpath);
   free(seqpath);
   if (seqs != NULL)
@@ -1210,7 +1394,7 @@ error:
   EXIT(1);
 }
 
-void Print_Read(char *s, int width)
+static void Print_Contig(char *s, int width)
 { int i;
 
   if (s[0] < 4)
@@ -1396,6 +1580,9 @@ int Write_GDB(GDB *gdb, char *tpath)
   oneReal(of,3) = gdb->freq[3];
   oneWriteLine(of,'f',0,0);
 
+  if (gdb->iscaps)
+    oneWriteLine(of,'u',0,0);
+
   for (s = 0; s < gdb->nscaff; s++)
     { head = gdb->headers + gdb->scaffolds[s].hoff;
       oneWriteLine(of,'S',strlen(head),head);
@@ -1410,6 +1597,12 @@ int Write_GDB(GDB *gdb, char *tpath)
           oneInt(of,0) = len;
           oneWriteLine(of,'C',0,0);
           spos = gdb->contigs[c].sbeg + len;
+          if (c == gdb->ncontig-1)
+            len = 2*(gdb->nmasks - gdb->contigs[c].moff);
+          else
+            len = 2*(gdb->contigs[c+1].moff - gdb->contigs[c].moff);
+          if (len > 0)
+            oneWriteLine(of,'M',len,(int64 *) (gdb->masks + gdb->contigs[c].moff));
         }
       if (gdb->scaffolds[s].slen > spos)
         { oneInt(of,0) = gdb->scaffolds[s].slen - spos;
@@ -1445,6 +1638,69 @@ void Close_GDB(GDB *gdb)
 
 /*******************************************************************************************
  *
+ *  CREATE OR READ GDB FOR 1-ALN INTERPRETATION
+ *
+ ********************************************************************************************/
+
+FILE **Get_GDB(GDB *gdb, char *source, char *cpath, int num_bps)
+{ int   used_cpath;
+  int   i, type;
+  char *spath, *tpath;
+  FILE *test, **units;
+
+  used_cpath = 0;
+  test = fopen(source,"r");
+  if (test == NULL)
+    { if (*source != '/')
+        test = fopen(MyCatenate(cpath,"/",source,""),"r");
+      if (test == NULL)
+        { EPRINTF(EPLACE,"%s: Could not find GDB %s\n",Prog_Name,source);
+          EXIT (NULL);
+        }
+      source = Strdup(MyCatenate(cpath,"/",source,""),"Allocating expanded name");
+      used_cpath = 1;
+    }
+  fclose(test);
+
+  type  = Get_GDB_Paths(source,NULL,&spath,&tpath,0);
+  if (type != IS_GDB)
+    units = Create_GDB(gdb,spath,type,num_bps,NULL,0);
+  else
+    { Read_GDB(gdb,tpath);
+      units = (FILE **) &(gdb->seqs);
+      if (num_bps > 0)
+        { if (gdb->seqs == NULL)
+            { EPRINTF(EPLACE,"%s: GDB %s must have sequence data\n",Prog_Name,tpath);
+              EXIT (NULL);
+            }
+          if (num_bps > 1)
+            { units = malloc(sizeof(FILE *)*num_bps);
+              if (units == NULL)
+                { EPRINTF(EPLACE,"%s: Could not allocate units array for GDB's\n",Prog_Name);
+                  EXIT(NULL);
+                }
+              units[0] = gdb->seqs;
+              for (i = 1; i < num_bps; i++)
+                { units[i] = fopen(gdb->seqpath,"r");
+                  if (units[i] == NULL)
+                    { EPRINTF(EPLACE,"%s: Cannot open another copye of GDB bps %s\n",
+                                     Prog_Name,gdb->seqpath);
+                      free(units);
+                      EXIT(NULL);
+                    }
+                }
+            }
+        }
+    }
+
+  if (used_cpath)
+    free(source);
+  return (units);
+}
+
+
+/*******************************************************************************************
+ *
  *  READ BUFFER ALLOCATION, LOAD, & LOAD_ALL
  *
  ********************************************************************************************/
@@ -1457,7 +1713,7 @@ void Close_GDB(GDB *gdb)
 char *New_Contig_Buffer(GDB *gdb)
 { char *contig;
 
-  contig = (char *) malloc(gdb->maxctg+4);
+  contig = (char *) malloc(gdb->maxctg+8);
   if (contig == NULL)
     { EPRINTF(EPLACE,"%s: Cannot allocate a contig buffer\n",Prog_Name);
       EXIT(NULL);
@@ -1479,8 +1735,11 @@ char *Get_Contig(GDB *gdb, int i, int stype, char *buffer)
 { char       *m = (char *) gdb->seqs;
   FILE       *b = (FILE *) gdb->seqs;
   GDB_CONTIG *c = gdb->contigs;
+  GDB_MASK   *masks = gdb->masks;
   int64       off;
   int         len, clen;
+
+  (void) Print_Contig;
 
   if (m == NULL)
     { EPRINTF(EPLACE,"%s: GDB has no sequence data\n",Prog_Name);
@@ -1538,8 +1797,19 @@ char *Get_Contig(GDB *gdb, int i, int stype, char *buffer)
 
       if (stype == NUMERIC)
         buffer[-1] = 4;
-      else if (stype != COMPRESSED)
-        buffer[-1] = 0;
+      else if (stype == UPPER_CASE)
+        { int64 r, e, f, p;
+
+          e = c[i+1].moff;
+          for (r = c[i].moff; r < e; r++)
+            { f = masks[r].end;
+              for (p = masks[r].beg; p < f; p++)
+                buffer[p] += 32;
+            }
+          buffer[-1] = '\0';
+        }
+      else if (stype == LOWER_CASE)
+        buffer[-1] = '\0';
 
       return (buffer);
     }
@@ -1558,16 +1828,25 @@ char *Get_Contig(GDB *gdb, int i, int stype, char *buffer)
     return (buffer);
 
   Uncompress_Read(len,buffer);
-  if (stype == LOWER_CASE)
+  if (stype == NUMERIC)
+    buffer[-1] = 4;
+  else if (stype == LOWER_CASE)
     { Lower_Read(buffer);
       buffer[-1] = '\0';
     }
-  else if (stype == UPPER_CASE)
-    { Upper_Read(buffer);
+  else
+    { int64 r, e, f, p;
+
+
+      Upper_Read(buffer);
+      e = c[i+1].moff;
+      for (r = c[i].moff ; r < e; r++)
+        { f = masks[r].end;
+          for (p = masks[r].beg; p < f; p++)
+            buffer[p] += 32;
+        }
       buffer[-1] = '\0';
     }
-  else
-    buffer[-1] = 4;
 
   return (buffer);
 }
@@ -1577,8 +1856,9 @@ char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffe
 { FILE       *b  = (FILE *) gdb->seqs;
   char       *m  = (char *) gdb->seqs;
   GDB_CONTIG *c = gdb->contigs;
-  int64      off;
-  int        len, clen, bbeg;
+  GDB_MASK   *masks = gdb->masks;
+  int64       off;
+  int         len, clen, bbeg;
 
   if (m == NULL)
     { EPRINTF(EPLACE,"%s: GDB has no sequence data (Get_Contig_Piece)\n",Prog_Name);
@@ -1592,7 +1872,6 @@ char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffe
     { EPRINTF(EPLACE,"%s: Index %d out of bounds (Get_Contig_Piece)\n",Prog_Name,i);
       EXIT(NULL);
     }
-
 
   if (beg < 0 || end > c[i].clen)
     { EPRINTF(EPLACE,"%s: Subrange %d,%d out of bounds (Get_Contig_Piece)\n",Prog_Name,beg,end);
@@ -1643,8 +1922,19 @@ char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffe
 
       if (stype == NUMERIC)
         buffer[-1] = 4;
-      else if (stype != COMPRESSED)
-        buffer[-1] = 0;
+      else if (stype == UPPER_CASE)
+        { int64 r, e, f, p;
+
+          e = c[i+1].moff;
+          for (r = c[i].moff; r < e; r++)
+            { f = masks[r].end - beg;
+              for (p = masks[r].beg - beg; p < f; p++)
+                buffer[p] += 32;
+            }
+          buffer[-1] = '\0';
+        }
+      else if (stype == LOWER_CASE)
+        buffer[-1] = '\0';
 
       return (buffer);
     }
@@ -1660,16 +1950,25 @@ char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffe
   Uncompress_Read(4*clen,buffer);
   buffer += beg%4;
   buffer[len] = 4;
-  if (stype == LOWER_CASE)
+  if (stype == NUMERIC)
+    buffer[-1] = 4;
+  else if (stype == LOWER_CASE)
     { Lower_Read(buffer);
       buffer[-1] = '\0';
     }
-  else if (stype == UPPER_CASE)
-    { Upper_Read(buffer);
+  else
+    { int64 r, e, f, p;
+
+      Upper_Read(buffer);
+      e = c[i+1].moff;
+      for (r = c[i].moff ; r < e; r++)
+        { f = masks[r].end - beg;
+          for (p = masks[r].beg - beg; p < f; p++)
+            buffer[p] += 32;
+        }
       buffer[-1] = '\0';
     }
-  else
-    buffer[-1] = 4;
 
   return (buffer);
 }
+

@@ -240,10 +240,12 @@ void Complement_Seq(char *a, int n);
      to point at an integer array within the storage of the Work_Data packet encoding an
      exact optimal trace from the start to end points.  If the trace is needed beyond the
      next call to a routine that sets it, then it should be copied to an array allocated
-     and managed by the caller.  If dlow <= dhgh then the alignment is constrained to lie within
-     the diagonal bands [dlow,dhgh], otherwise there is no constraint.
+     and managed by the caller.
 
      Compute_Trace_PTS computes a trace by computing the trace between successive trace points.
+     If dlow <= dhgh then the alignment is restricted to be between diagonals dlow and dhgh,
+     inclusive.  Otherwise the alignment is unrestricted.
+
      It is much, much faster than Compute_Alignment below but at the tradeoff of not necessarily
      being optimal as trace points are not all perfect.  Compute_Trace_MID computes a trace
      by computing the trace between the mid-points of alignments between two adjacent pairs of trace
@@ -257,7 +259,8 @@ void Complement_Seq(char *a, int n);
 
   int Compute_Trace_PTS(Alignment *align, Work_Data *work, int trace_spacing,
                         int mode, int dlow, int dhgh);
-  int Compute_Trace_MID(Alignment *align, Work_Data *work, int trace_spacing, int mode);
+  int Compute_Trace_MID(Alignment *align, Work_Data *work, int trace_spacing,
+                        int mode, int dlow, int dhgh);
 
   /* Compute_Trace_IRR (IRR for IRRegular) computes a trace for the given alignment where
      it assumes the spacing between trace points between both the A and B read varies, and
@@ -266,7 +269,8 @@ void Complement_Seq(char *a, int n);
      and may not persist in later versions of the code.
   */
 
-  int Compute_Trace_IRR(Alignment *align, Work_Data *work, int mode);   //  experimental !!
+  int Compute_Trace_IRR(Alignment *align, Work_Data *work,   //  experimental !!
+                        int mode, int dlow, int dhgh);
 
   /* Compute Alignment determines the best alignment between the substrings specified by align.
      If the task is DIFF_ONLY, then only the difference of this alignment is computed and placed
@@ -316,10 +320,13 @@ void Complement_Seq(char *a, int n);
   void Alignment_Cartoon(FILE *file, Alignment *align, int indent, int coord);
 
   int  Print_Alignment(FILE *file, Alignment *align, Work_Data *work,
-                       int indent, int width, int border, int upper, int coord);
+                       int indent, int width, int border, int upper, int coord, int reverse);
 
   int  Print_Reference(FILE *file, Alignment *align, Work_Data *work,
-                       int indent, int block, int border, int upper, int coord);
+                       int indent, int block, int border, int upper, int coord, int reverse);
+
+  int  Transmit_Alignment(void (*reciever)(char *), Alignment *align, Work_Data *work,
+                          int width, int border, int upper, int coord, int reverse);
 
   void Flip_Alignment(Alignment *align, int full);
 
