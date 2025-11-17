@@ -22,28 +22,15 @@
 #include "align.h"
 #include "alncode.h"
 
-#define TSPACE   100
 #define VERSION "0.1"
+#define TSPACE   100
+#define DIAG_MAX 8000
 
 static char *Usage = "[-vm] [-T(8)] <source:path>[<fa_extn>|<1_extn>] <target>[.1aln]";
 
 static int NTHREADS;
 static int VERBOSE;
-static int MODELS;
-
-typedef struct
-   { int         tid;
-     OneFile    *ofile;
-     Work_Data  *work;
-     Align_Spec *spec;
-     GDB         _gdb, *gdb;
-     Overlap     _over, *over;
-     Alignment   _align, *align;
-     void       *block;
-     uint8      *buffer;
-     int         tmax;
-     int64      *trace;
-   } S_Bundle;
+static int MASK_DB;
 
 static char dna[4] = { 'a', 'c', 'g', 't' };
 
@@ -69,11 +56,173 @@ static char *emer(int x, int unit)
 
 /*******************************************************************************************
  *
- *  SEED CHAIN DETECTOR
+ *  DYNAMIC MASK LISTS
  *
  ********************************************************************************************/
 
-#define DIAG_MAX 8000
+typedef struct _Mask_Block
+  { struct _Mask_Block *link;
+    int64               beg[1000]; 
+    int64               end[1000]; 
+  } Mask_Block;
+
+typedef struct _Mask_List
+  { Mask_Block *start;
+    Mask_Block *current;
+    int         ctop;
+    int         nblk;
+  } Mask_List;
+
+static void Init_Masks(Mask_List *masks)
+{ masks->current = Malloc(sizeof(Mask_Block),"Allocating first Mask_Block");
+  if (masks->current == NULL)
+    exit (1);
+  masks->start = masks->current;
+  masks->current->link = NULL;
+  masks->ctop = 0;
+  masks->nblk = 0;
+}
+
+static void Add_Mask(int beg, int end, Mask_List *masks)
+{ int         ctop;
+  Mask_Block *curr, *next;
+ 
+  ctop = masks->ctop;
+  curr = masks->current;
+  if (ctop >= 1000)
+    { next = curr->link;
+      if (next == NULL)
+        { curr->link = next = Malloc(sizeof(Mask_Block),"Allocating another Mask_Block");
+          if (next == NULL)
+            exit (1);
+          next->link = NULL;
+        }
+      masks->current = curr = next;
+      ctop  = 0;
+      masks->nblk += 1;
+    }
+  curr->beg[ctop] = beg;
+  curr->end[ctop] = end;
+  masks->ctop = ctop+1;
+}
+
+static void Free_Masks(Mask_List *masks)
+{ Mask_Block *m, *n;
+
+  for (m = masks->start; m != NULL; m = n)
+    { n = m->link;
+      free(m);
+    }
+}
+
+
+/*******************************************************************************************
+ *
+ *  SPECIAL VERSION OF GDB WRITE
+ *
+ ********************************************************************************************/
+
+//  If the genome/sequence is masked then it must be upper-case (i.e. u-line is present)
+    
+static char *gdbSchemaText =
+  "1 3 def 1 0                         schema for genome skeleton\n"
+  ".\n"
+  "P 3 gdb                             GDB\n"
+  "D f 4 4 REAL 4 REAL 4 REAL 4 REAL   global: base frequency vector\n"
+  "D u 0                               global: upper case when displayed\n"
+  "O S 1 6 STRING                      id for a scaffold\n"
+  "D G 1 3 INT                         gap of given length\n"
+  "D C 1 3 INT                         contig of given length\n"
+  "D M 1 8 INT_LIST                    mask pair list for a contig\n"
+;         
+          
+static OneSchema *make_GDB_Schema()
+{ return (oneSchemaCreateFromText(gdbSchemaText)); }
+
+
+// Write the given gdb to the file 'tpath'.  The GDB must have seqstate EXTERNAL and tpath
+//   must be consistent with the name of the .bps file.
+
+extern bool addProvenance(OneFile *of, OneProvenance *from, int n) ; // backdoor - clean up some day
+
+int Write_GDB_Special(GDB *gdb, char *tpath)
+{ OneSchema *schema;                   
+  OneFile   *of;                       
+  bool       binary;                   
+  int64      spos, len;
+  char      *head;
+  int        s, c;
+  GDB_MASK  *m, *n;
+
+  if (strcmp(tpath+strlen(tpath)-4,".gdb") == 0)
+    binary = false;
+  else 
+    binary = true;
+
+  schema = make_GDB_Schema();
+  if (schema == NULL)
+    { EPRINTF("Failed to create GDB schema (Write_GDB)");
+      EXIT(1);
+    }
+
+  of = oneFileOpenWriteNew(tpath,schema,"gdb",binary,1);
+  if (of == NULL)
+    { EPRINTF("Failed to open GDB file %s (Write_GDB)",tpath);
+      oneSchemaDestroy(schema);
+      EXIT(1);
+    }
+
+  addProvenance(of,gdb->prov,gdb->nprov);
+  oneAddProvenance(of,Prog_Name,"0.1",Command_Line);
+
+  oneAddReference(of,gdb->srcpath,1);
+
+  oneReal(of,0) = gdb->freq[0];
+  oneReal(of,1) = gdb->freq[1];
+  oneReal(of,2) = gdb->freq[2];
+  oneReal(of,3) = gdb->freq[3];
+  oneWriteLine(of,'f',0,0);
+  oneWriteLine(of,'u',0,0);
+
+  for (s = 0; s < gdb->nscaff; s++)
+    { head = gdb->headers + gdb->scaffolds[s].hoff;
+      oneWriteLine(of,'S',strlen(head),head);
+
+     spos = 0;
+      for (c = gdb->scaffolds[s].fctg; c < gdb->scaffolds[s].ectg; c++)
+        { if (gdb->contigs[c].sbeg > spos)
+            { oneInt(of,0) = gdb->contigs[c].sbeg - spos;
+              oneWriteLine(of,'G',0,0);
+            }
+          len = gdb->contigs[c].clen;
+          oneInt(of,0) = len;
+          oneWriteLine(of,'C',0,0);
+          spos = gdb->contigs[c].sbeg + len;
+          
+          m = n = (GDB_MASK *) (gdb->contigs[c].moff);
+          while (n->beg >= 0)
+            n += 1;
+          len = n-m;
+          if (len > 0)
+            oneWriteLine(of,'M',len,(int64 *) m);
+        }
+      if (gdb->scaffolds[s].slen > spos)
+        { oneInt(of,0) = gdb->scaffolds[s].slen - spos;
+          oneWriteLine(of,'G',0,0);
+        }
+    }
+
+  oneFileClose(of);
+  oneSchemaDestroy(schema);
+  return (0);
+}
+
+
+/*******************************************************************************************
+ *
+ *  SEED CHAIN DETECTOR
+ *
+ ********************************************************************************************/
 
 #undef   PROLOG
 #undef   SORT1
@@ -81,206 +230,21 @@ static char *emer(int x, int unit)
 #undef   SHOW_SEEDS
 #undef   SHOW_SEARCH
 #undef   SHOW_ALIGNMENTS
-#undef   COMPUTE_MODEL
-
-#ifdef COMPUTE_MODEL
-
+ 
 typedef struct
-  { int    edge[4];
-    int    count;
-    uint16 kmer;
-    uint16 mark;
-    uint16 depth;
-  } Dnode;
-
-static int compute_model(uint8 *seq, int len, uint16 *alive, int unit)
-{ int     i, x, c, e;
-  uint16  kmer, klen, umask;
-  uint8  *s7, *s8;
-  int     l7;
-  int     clen;
-
-  int    stop, node;
-  Dnode *stack;
-  int    maxnode, maxcount;
-  double density;
-  int    dcut;
-  int   *mark;
-
-  if (unit > 8)
-    klen = 8;
-  else
-    klen = unit;
-
-  s7 = seq+(klen-1);
-  s8 = seq+klen;
-  l7 = len-(klen-1);
-  if (klen >= 8)
-    umask = 0xffff; 
-  else
-    umask = (1 << (2*klen)) - 1;
-
-  stop = 0;         //  count # of each 8-mer
-  kmer = seq[0];
-  for (i = 1; i < klen-1; i++)
-    { x = seq[i];
-      kmer = (kmer << 2) | x;
-    }
-  for (i = 0; i < l7; i++)
-    { x = s7[i];
-      kmer = ((kmer << 2) | x) & umask;
-      node = alive[kmer];
-      if (node == 0)
-        { alive[kmer] = 0x7fff;
-          stop += 1;
-        }
-    }
-
-  stack = malloc(sizeof(Dnode)*stop);
-  mark  = malloc(sizeof(int)*stop);
-  if (stack == NULL || mark == NULL)
-    { printf("MALLOC\n");
-      exit (1);
-    }
-
-  maxcount = 0;
-  stop = 0;         //  count # of each 8-mer
-  kmer = seq[0];
-  for (i = 1; i < klen-1; i++)
-    { x = seq[i];
-      kmer = (kmer << 2) | x;
-    }
-  for (i = 0; i < l7; i++)
-    { x = s7[i];
-      kmer = ((kmer << 2) | x) & umask;
-      node = alive[kmer];
-      if (node == 0x7fff)
-        { alive[kmer] = node = stop++;
-          stack[node].edge[0] = stack[node].edge[1] = stack[node].edge[2] = stack[node].edge[3] = 0;
-          stack[node].kmer    = kmer;
-          stack[node].count   = 0;
-          stack[node].mark    = 0;
-        }
-      stack[node].count += 1;
-      stack[node].edge[s8[i]] += 1;
-      if (stack[node].count > maxcount)
-        { maxcount = stack[node].count;
-          maxnode  = node;
-        }
-    }
-
-  density = (1.*len)/unit;
-  printf("\nDB Graph(%d): %d ave = %d/%d = %.1f\n",klen,stop,len,unit,density);
-  printf("  max = %d (%d)\n",maxnode,maxcount);
-  dcut = .05*density;
-  if (dcut < 1)
-    dcut = 1;
-
-  { int n, m, p, y, e, x, s;
-    int mtop;
-    int emax, enod, etod, echr;
-    int deep;
-
-    clen = 0;
-    mtop = 0;
-    stack[maxnode].mark = 2;
-    stack[maxnode].depth = 0;
-    mark[mtop++] = maxnode;
-    for (i = 0; i < 10; i++)
-      { emax = 0;
-        for (s = 0; s < mtop; s++)
-          { n = mark[s];
-            p = (stack[n].kmer << 2) & umask;
-            for (x = 0; x < 4; x++)
-              { if (stack[n].edge[x] <= emax) 
-                  continue;
-                m = alive[p | x];
-                if (stack[m].mark)
-                  continue;
-                emax = stack[n].edge[x];
-                enod = n;
-                etod = m;
-                echr = x;
-              }
-          }
-        if (emax <= dcut)
-          break;
-
-        printf("\n  %d(%d) : %d\n",enod,stack[enod].count,stack[enod].depth);
-        deep = stack[enod].depth+1;
-        printf("      -%c(%d)-> %d(%d) : %d\n",dna[echr],emax,etod,stack[etod].count,deep);
-        n = etod;
-        while (stack[n].mark == 0)
-          { stack[n].mark = 1;
-            stack[n].depth = deep;
-            y = 0;
-            e = stack[n].edge[y];
-            for (x = 1; x < 4; x++)
-              if (stack[n].edge[x] > e)
-                { y = x;
-                  e = stack[n].edge[y];
-                }
-            p = (stack[n].kmer << 2) & umask;
-            n = alive[p | y];
-            deep += 1;
-            printf("      -%c(%d)-> %d(%d) : %d\n",dna[y],e,n,stack[n].count,deep);
-          }
-        if (stack[n].depth == deep || (n == maxnode && stack[n].depth == clen))
-          printf("   Detour\n");
-        if (stack[n].mark == 1)
-          printf("   New cycle @ %d\n",n);
-        if (clen == 0)
-          { clen = deep - stack[n].depth;
-            printf("   Main unit len = %d\n",clen);
-          }
-
-        printf("\n   %c",dna[echr]);
-        n = etod;
-        while (stack[n].mark == 1)
-          { stack[n].mark = 2;
-            mark[mtop++]  = n;
-            y = 0;
-            e = stack[n].edge[y];
-            p = (stack[n].kmer << 2) & umask;
-            for (x = 1; x < 4; x++)
-              if (stack[n].edge[x] > e)
-                { y = x;
-                  e = stack[n].edge[y];
-                }
-            n = alive[p | y];
-            printf("%c",dna[y]);
-          }
-        printf("\n");
-      }
-  }
-
-  for (i = 0; i < stop; i++)
-    { kmer = stack[i].kmer;
-      c    = stack[i].count;
-      if (c <= dcut)
-        continue;
-      printf(" %3d: %s(%d)\n",i,emer(kmer,klen),c);
-      for (x = 0; x < 4; x++)
-        { e = stack[i].edge[x];
-          if (e <= dcut)
-            continue;
-          printf("      -%c(%d)-> %d\n",dna[x],e,alive[((kmer << 2) | x) & umask]);
-        }
-    }
-
-  for (i = 0; i < stop; i++)
-    alive[stack[i].kmer] = 0;
-
-  free(mark);
-  free(stack);
-
-  if (clen < .9*unit)
-    printf("    Bad call\n");
-
-  return (clen);
-}
-
-#endif
+   { int         tid;
+     OneFile    *ofile;
+     Work_Data  *work;
+     Align_Spec *spec;
+     GDB         _gdb, *gdb;
+     Overlap     _over, *over;
+     Alignment   _align, *align;
+     void       *block;
+     uint8      *buffer;
+     int         tmax;
+     int64      *trace;
+     Mask_List   masks;
+   } S_Bundle;
 
 typedef struct
   { uint16  diag;
@@ -307,6 +271,7 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
   OneFile    *ofile = bundle->ofile;
   int64      *t64   = bundle->trace;
   int         tmax  = bundle->tmax;
+  Mask_List  *masks = &bundle->masks;
 
   int     i, p, x, c;
   int     d, e, f;
@@ -531,7 +496,8 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
             oneInt(ofile,0) = d;
             oneWriteLine(ofile,'U',0,0);
 
-            Decompress_TraceTo16(over);
+            if (MASK_DB)
+              Add_Mask(bpath->abpos,bpath->bepos,masks);
 
 #ifdef SHOW_ALIGNMENTS
 #ifndef SHOW_SEARCH
@@ -539,6 +505,7 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
               printf(" %4d: %5d\n",d,diags[d]-diags[d-1]);
             printf("\n");
 #endif
+            Decompress_TraceTo16(over);
             printf(" Hit spans %d-%d\n",bpath->abpos,bpath->bepos);
             Compute_Trace_PTS(align,work,100,GREEDIEST,d-wide,d+wide);
             Print_Alignment(stdout,align,work,8,100,10,0,10,0);
@@ -550,18 +517,9 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
                 end = bpath->aepos-off;
                 for (f = beg+1; f <= end; f++)
                   seq[f] = 4;
-
-#ifdef COMPUTE_MODEL
-                printf("  Near Tandem %d-%d\n",bpath->bbpos-bpath->aepos,bpath->aepos-bpath->abpos);
-#endif
               }
             else
-              { 
-#ifdef COMPUTE_MODEL
-                compute_model(seq+beg,end-beg,count,d);
-#endif
-
-                for (f = beg+1; f <= end; f++)
+              { for (f = beg+1; f <= end; f++)
                   seq[f] = 4;
               }
 
@@ -606,6 +564,9 @@ static void *compress_thread(void *args)
   bundle->align->alen  = bundle->align->blen = clen;
   bundle->over->bread  = i;
 
+  bundle->masks.ctop = 0;
+  bundle->masks.current = bundle->masks.start;
+
   last = -1;
   if (clen < 0x8000)
     spectrum_block(buffer,0,clen,bundle);
@@ -619,6 +580,32 @@ static void *compress_thread(void *args)
               p = last-0x6000;
           }
       }
+
+  if (MASK_DB)
+    { Mask_Block *m;
+      GDB_MASK   *cm;
+      int         c, t, ctop;
+
+      cm = Malloc(sizeof(GDB_MASK)*(1000*bundle->masks.nblk + bundle->masks.ctop + 1),
+                         "Allocating contig mask array");
+      gdb->contigs[i].moff = (int64) cm;
+
+      t = 0;
+      for (m = bundle->masks.start; 1; m = m->link)
+        { if (m == bundle->masks.current)
+            ctop = bundle->masks.ctop;
+          else
+            ctop = 1000;
+          for (c = 0; c < ctop; c++, t++)
+            { cm[t].beg = m->beg[c];
+              cm[t].end = m->end[c];
+              // printf("M %d %d\n",m->beg[c],m->end[c]);
+            }
+          if (m == bundle->masks.current)
+            break;
+        }
+      cm[t].beg = -1;
+    }
  
   pthread_mutex_lock(&TMUTEX);   //  Put this thread back on the avail stack
     Tstack[Tavail++] = bundle->tid;
@@ -631,6 +618,7 @@ static void *compress_thread(void *args)
 
 int main(int argc, char *argv[])
 { FILE   **units;
+  char    *spath;
   GDB     _gdb, *gdb = &_gdb;
   OneFile *Ofile;
 
@@ -663,8 +651,7 @@ int main(int argc, char *argv[])
     argc = j;
 
     VERBOSE = flags['v'];
-    MODELS  = flags['m'];
-    MODELS  = 0;              //  Not yet realized
+    MASK_DB = flags['m'];
 
     if (argc != 3)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage);
@@ -674,21 +661,26 @@ int main(int argc, char *argv[])
         fprintf(stderr,"\n");
         fprintf(stderr,"      -v: Verbose mode, output statistics as proceed.\n");
         fprintf(stderr,"      -T: Number of threads to use.\n");
-        fprintf(stderr,"      -m: Compute models of each hit (not yet implemented).\n");
+        fprintf(stderr,"      -m: Mask the data base with hits found.\n");
         exit (1);
       }
   }
 
   //  Get GDB or make a temporary if a fasta
 
-  { char *tpath, *spath;
-    char *cpath, *APATH, *AROOT;
+  { char *cpath, *APATH, *AROOT;
+    int   ftype;
 
-    Get_GDB_Paths(argv[1],NULL,&spath,&tpath,0);
+    ftype = Get_GDB_Paths(argv[1],NULL,&spath,&cpath,0);
+
+    free(cpath);
+
+    if (MASK_DB && ftype != IS_GDB)
+      { fprintf(stderr,"%s: The source must be a GDB when masking (-m) is on\n",Prog_Name);
+        exit (1);
+      }
   
     units = Get_GDB(gdb,spath,".",NTHREADS);
-
-    free(tpath);
 
     //  Open 1aln file for threaded writing
 
@@ -701,7 +693,8 @@ int main(int argc, char *argv[])
     free(cpath);
     free(AROOT);
     free(APATH);
-    free(spath);
+
+    // oneAddProvenance(Ofile,Prog_Name,"v0.5",Command_Line);
 
     Write_Aln_Skeleton(Ofile,gdb);
   }
@@ -742,6 +735,7 @@ int main(int argc, char *argv[])
           { fprintf(stderr,"%s: Not enough memory\n",Prog_Name);
             exit (1);
           }
+        Init_Masks(&parm[i].masks);
       }
 
     Tstack = tstack;
@@ -785,9 +779,13 @@ int main(int argc, char *argv[])
         if (i == 0)
           Free_Align_Spec(parm[i].spec);
         Free_Work_Data(parm[i].work);
+        Free_Masks(&parm[i].masks);
       }
 
     oneFileClose(Ofile);
+
+    if (MASK_DB)
+      Write_GDB_Special(gdb,spath);
 
     Close_GDB(gdb);
 
@@ -795,6 +793,8 @@ int main(int argc, char *argv[])
       { TimeTo(stderr,0,1);
         TimeTo(stderr,1,0);
       }
+
+    free(spath);
 
     Catenate(NULL,NULL,NULL,NULL);
     Numbered_Suffix(NULL,0,NULL);

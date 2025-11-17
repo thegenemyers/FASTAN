@@ -200,4 +200,4 @@ char *Get_Contig(GDB *gdb, int i, int stype, char *buffer);
 
 char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffer);
 
-#endif // _GDB_DEFS
+#endif  // _GDB_DEFS

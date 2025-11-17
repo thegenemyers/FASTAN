@@ -4,7 +4,7 @@ CFLAGS = -O3 -Wall -Wextra -Wno-unused-result -fno-strict-aliasing
 
 CC = gcc
 
-ALL = FasTAN # NewTAN
+ALL = FasTAN NewTAN
 
 all: $(ALL)
 
