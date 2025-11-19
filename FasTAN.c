@@ -492,9 +492,7 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
               }
             Write_Aln_Overlap(ofile,over);
             Compress_TraceTo8(over,0);
-            Write_Aln_Trace(ofile,over->path.trace,over->path.tlen,t64);
-            oneInt(ofile,0) = d;
-            oneWriteLine(ofile,'U',0,0);
+            Write_Aln_Trace(ofile,over->path.trace,over->path.tlen,t64,d);
 
             if (MASK_DB)
               Add_Mask(bpath->abpos,bpath->bepos,masks);
