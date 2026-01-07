@@ -30,9 +30,12 @@
 #undef   SHOW_SEARCH
 #undef   SHOW_ALIGNMENTS
 
+#define DIAG_MAX       20000
+#define DIAG_MIN        3000
+#define BLOCK_OVERLAP  20000  //  Must be less than 32000
+
 #define TSPACE     100
 #define VERSION  "0.5"
-#define DIAG_MAX 30000
 #define MBUF_LEN   200  //  Must be even
 
 static char *Usage = "[-vM] [-T(8)] <source:path>[<fa_extn>|<1_extn>] <target>[.1aln]";
@@ -351,6 +354,8 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
     outhit = 0;
     for (i = 0; i < ncnt; i++)
       { d = hist[i].diag;
+        if (d < DIAG_MIN || d > DIAG_MAX)
+          continue;
 
         last = -1;
 #ifdef SHOW_SEARCH
@@ -383,7 +388,7 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
               continue;
             if (end > last)
               last = end;
-            if (end-beg < 1.95*d)
+            if (path->bepos >= path->abpos)
               continue;
 
             unit = ave_tp_diag(path);
@@ -401,6 +406,12 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
                   { oneInt(mfile,0) = mscf;
                     oneWriteLine(mfile,'M',mint,mlist);
                     oneWriteLine(mfile,'L',mstr-mstring,mstring);
+printf("list =");
+for (i = 0; i < mint; i++)
+  printf(" %lld",mlist[i]);
+printf("\n");
+*mstr = '\0';
+printf("string = '%s'\n",mstring);
                     mint = 0;
                     mstr = mstring;
                   }
@@ -505,13 +516,13 @@ static void *compress_thread(void *args)
   if (clen < 0x8000)
     spectrum_block(buffer,0,clen,bundle);
   else
-    for (p = 0; p+0x2000 <= clen; p += 0x6000)
+    for (p = 0; p+0x2000 <= clen; p += BLOCK_OVERLAP)
       { if (p+0x8000 > clen)
           spectrum_block(buffer+p,p,clen-p,bundle);
         else
           { last = spectrum_block(buffer+p,p,0x8000,bundle);
-            if (last >= p+0x6000)
-              p = last-0x6000;
+            if (last >= p+BLOCK_OVERLAP)
+              p = last-BLOCK_OVERLAP;
           }
       }
 

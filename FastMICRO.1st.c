@@ -30,6 +30,11 @@
 #undef   SHOW_SEARCH
 #undef   SHOW_ALIGNMENTS
 
+#define  ID_MIN  .7
+#define  ID_REG  12  //  ceiling(ID_MIN * 16)
+
+#define MIN_SPAN 8
+
 #define TSPACE     100
 #define VERSION  "0.5"
 #define DIAG_MAX 30000
@@ -48,18 +53,6 @@ static void Print_Seq(uint8 *seq, int len)
 
   for (j = 0; j < len; j++)
     printf("%c",dna[seq[j]]);
-}
-
-static char *emer(int x, int unit)
-{ static char mer[9];
-  int i;
-
-  mer[unit] = '\0';
-  for (i = unit-1; i >= 0; i--)
-    { mer[i] = dna[x&0x3];
-      x >>= 2;
-    }
-  return (mer);
 }
 
 /*******************************************************************************************
@@ -97,49 +90,199 @@ typedef struct
      int64       moff;
    } S_Bundle;
 
-  //  Return average diagonal of trace points + the 2 end points
+static int GoodX[0x10000];
+static int GoodR[0x10000];
 
-static int ave_tp_diag(Path *path)
-{ int     tlen;
-  uint16 *trace;
-  int64   ave;
-  int     ab, bb;
-  int     i;
-
-  tlen  = path->tlen-2;
-  trace = path->trace;
-
-  ab = path->abpos;
-  bb = path->bbpos;
-  ave = ab-bb;
-  ab = (ab/TSPACE)*TSPACE;
-  for (i = 1; i < tlen; i += 2)
-    { ab = ab + TSPACE;
-      bb = bb + trace[i];
-      ave += (ab-bb); 
+static void suffix_positive(int val, int total, int good)
+{ if (total == 16)
+    GoodX[val] = 1;
+  else
+    { suffix_positive((0x1<<total)|val,total+1,good+1);
+      if (good > ID_MIN*(total+1))
+        suffix_positive(val,total+1,good);
     }
-  ave += path->aepos - path->bepos;
-  return ((int) ((ave/(tlen/2+2.))+.5));
 }
 
-typedef struct
-  { uint16  diag;
-    uint16  ibeg;
-  } Seed;
+static void good_region(int val, int bits, int good)
+{ if (good < ID_REG)
+    { if ((16-bits)+good >= ID_REG)
+        { val <<= 1;
+          bits += 1;
+          good_region(val,bits,good);
+          good_region(val+1,bits,good+1);
+        }
+    }
+  else
+    { int i;
 
-typedef struct
-  { uint16 diag;
-    uint16 count;
-  } Chord;
-
-static int CSORT(const void *l, const void *r)
-{ Chord *x = (Chord *) l;
-  Chord *y = (Chord *) r;
-
-  return (y->count - x->count);
+      val <<= (16-bits);
+      for (i = (1<<(16-bits)) - 1; i >= 0; i--)
+        GoodR[val+i] = 1;
+    }
 }
 
-static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
+static void Compute_Terminators()
+{ int i;
+
+  for (i = 0; i < 0x10000; i++)
+    GoodX[i] = GoodR[i] = 0;
+
+  suffix_positive(0,0,0);
+
+  good_region(0,0,0);
+
+  // for (i = 0xffff; i >= 0; i--)
+    // printf(" %04x: %d %d\n",i,GoodX[i],GoodR[i]);
+}
+
+static int extend_right(uint8 * seq, int slen, uint8 *unit, int ulen)
+{ int k, d;
+  int y, z;
+  int b, c;
+  int j;
+
+  int    _F[1001], *F = _F+500;
+  uint16 _B[1001], *B = _B+500;
+
+  j = 0;
+  for (z = 0; z < slen; z++)
+    { if (seq[z] != unit[j])
+        break;
+      z += 1;
+      j += 1;
+      if (j >= ulen)
+        j = 0;
+    }
+  F[0] = z;
+  B[0] = 0xffff;
+  printf("Wave  0: %4d\n         %4x\n         %4d\n",F[0],B[0],GoodX[B[0]]);
+
+  for (d = 1; d < 10; d++)
+    { k = -d;
+      y = F[k-1] = F[d+1] = F[k] = F[d] = -1;
+      c = 0;
+      for ( ; k <= d; k++)
+        { z = y;
+          y = F[k];
+          b = c;
+          c = B[k];
+          if (z < y)
+            { z = y;
+              b = c;
+            }
+          if (z < F[k+1])
+            { z = F[k+1];
+              b = B[k+1];
+            }
+          else
+            z += 1;
+          b <<= 1;
+          j = (z-k) % ulen;
+          while (z < slen)
+            { if (seq[z] != unit[j])
+                break;
+              z += 1;
+              j += 1;
+              b = (b<<1) | 1;
+              if (j >= ulen)
+                j = 0;
+            }
+          F[k] = z;
+          B[k] = b;
+        }
+      printf("Wave %2d:",d);
+      for (k = -d; k <= d; k++)
+        printf(" %4d",F[k]);
+      printf("\n        ");
+      for (k = -d; k <= d; k++)
+        printf(" %04x",B[k]);
+      printf("\n        ");
+      for (k = -d; k <= d; k++)
+        printf(" %4d",GoodX[B[k]]);
+      printf("\n");
+      fflush(stdout);
+    }
+  return (0);
+}
+
+/*
+static int extend_right2(uint8 *seq, int len, int a, int b)
+{ int valab, valba;
+  int x, y, z;
+  int i, val, score;
+  int ans;
+
+  valab = (a<<2) | b;
+  valba = (b<<2) | a;
+
+  score = 0;
+
+  ans = 0;
+  y = seq[-2];
+  z = seq[-1];
+  for (i = 0; i < len; i++)
+    { x = y;
+      y = z;
+      z = seq[i];
+      val = (z<<2)|y;
+      if (z == a || z == b)
+        { if (z == x && z != y)
+            score += 1;
+          if (val == valab || val == valba)
+            { if (score >= 0)
+                ans = i;
+              printf(" @%d: %d\n",i,score);
+            }
+        }
+      else
+        score -= 2;
+      if (score < -10)
+        break;
+    }
+  return (ans);
+}
+
+static int extend_right3(uint8 *seq, int len, int a, int b, int c)
+{ int valabc, valbca, valcab;
+  int u, x, y, z;
+  int i, val, score;
+  int ans;
+
+  valabc = (a<<4) | (b<<2) | c;
+  valbca = (b<<4) | (c<<2) | a;
+  valcab = (c<<4) | (a<<2) | b;
+
+  score = 0;
+
+  ans = 0;
+  x = seq[-3];
+  y = seq[-2];
+  z = seq[-1];
+  for (i = 0; i < len; i++)
+    { u = x;
+      x = y;
+      y = z;
+      z = seq[i];
+      val = (z<<4)|(y<<2)|x;
+      if (z == a || z == b || z == c)
+        { if (z == u && (z != y || z != x))
+            score += 1;
+          if (val == valabc || val == valbca || val == valcab)
+            { if (score >= 0)
+                ans = i;
+              printf(" @%d: %d\n",i,score);
+            }
+        }
+      else
+        score -= 2;
+      if (score < -10)
+        break;
+    }
+  return (ans);
+}
+*/
+
+static void micro_contig(uint8 *seq, int len, S_Bundle *bundle)
 { Alignment  *align = bundle->align;
   Overlap    *over  = bundle->over;
   Align_Spec *spec  = bundle->spec;
@@ -156,304 +299,123 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
   int         mscf    = bundle->mscf;
   int64       moff    = bundle->moff;
 
-  int     i, p, x, c;
-  int     d, e, f;
-  uint16  kmer;
-  uint16 *index;  // 0x08000
-  uint16 *count;  // 0x10000
-  uint16 *diags;  // DIAG_MAX < 0x08000
-  Seed   *post;   // 0x08000
-  Seed   *hits;   // 0x08000
-  uint8  *s7;
-  int     l7;
-  double  freq[4];
+  int lastr, lastl;
+  int a, b, c;
+  int i, j;
+  uint8 unit[4];
 
-  count = (uint16 *) bundle->block;
-  index = count + 0x10000;
-  diags = index + 0x08000; 
-  post  = (Seed *) (diags +  0x08000);
-  hits  = post + 0x08000;
-
-  (void) off;
-
-#ifdef PROLOG
-  printf("\nPANEL %d-%d\n",off,off+0x8000);
-  fflush(stdout);
-#endif
-
-  for (i = 0; i < 0x10000; i++)   //  Init counters
-    count[i] = 0;
-
-  s7 = seq+7;
-  l7 = len-7;
-
-  { int    fqi[4];
-    uint16 u;
-
-    for (i = 0; i < 4; i++)
-      fqi[i] = 0;
-
-    kmer = seq[0];                 //  count # of each 8-mer
-    fqi[kmer] = 1;
-    for (i = 1; i < 7; i++)
-      { u = seq[i];
-        kmer = (kmer << 2) | u;
-        fqi[u] += 1;
-      }
-    for (i = 0; i < l7; i++)
-      { u = s7[i];
-        kmer = (kmer << 2) | u;
-        count[kmer] += 1;
-        fqi[u] += 1;
-      }
-
-    for (i = 0; i < 4; i++)
-      freq[i] = (1.*fqi[i]) / len;
-  }
-
-  p = 0;                         //  turn counts into ptrs
-  for (i = 0; i < 0x10000; i++)
-    { x = count[i];
-      count[i] = p;
-      p += x;
-    }
-
-  kmer = seq[0];                 //  place positions in index in order of 8-mer
-  for (i = 1; i < 7; i++)
-    kmer = (kmer << 2) | seq[i];
-  for (i = 0; i < l7; i++)
-    { kmer = (kmer << 2) | s7[i];
-      index[count[kmer]++] = i;
-    }
-  index[l7] = 0;
-
-  index[0] |= 0x8000;           //  mark bucket ends and reset count
-  for (i = 0; i < 0xffff; i++)
-    { index[count[i]] |= 0x8000;
-      count[i] = 0;
-    }
-  count[0xffff] = 0;
-
-#ifdef SORT1
-  for (i = 0; i < l7; i++)
-    { f = index[i];
-      p = index[i] & 0x7fff;
-      printf("%c %5d: ",p==f?' ':'+',p);
-      Print_Seq(seq+p,8);
-      printf("\n");
-    }
-#endif
-
-  e = index[0] & 0x7fff;
-  for (i = 1; i < l7; i++)     //  count ibeg's of all same-kmer adjacent position pairs
-    { f = index[i];            //    that are within diag < DIAG_MAX (8Kbp)
-      if (f < 0x8000)
-        { d = f-e;
-          if (d < DIAG_MAX)
-            count[e] += 1;
-          e = f;
-        }
-      else
-        e = f & 0x7fff;
-    }
-
-  p = 0;                          //  turn counts into ptrs
-  for (i = 0; i < 0x08000; i++)
-    { x = count[i];
-      count[i] = p;
-      p += x;
-    }
-
-  for (i = 0; i < DIAG_MAX; i++)  //  init diagonal tube counters
-    diags[i] = 0;
-
-  e = index[0] & 0x7fff;
-  for (i = 1; i < l7; i++)       //   place seed pairs in post sorted on ibeg using count
-    { f = index[i];              //     ptrs.  Also count diagonal tubes for next sort.
-      if (f < 0x8000)
-        { d = f-e;
-          if (d < DIAG_MAX)
-            { c = count[e]++;
-              post[c].ibeg = e;
-              post[c].diag = d;
-              diags[d] += 1;
+/*
+  lastr = -1;
+  b = seq[0];
+  for (i = 0; i < len-MIN_SPAN; i++)
+    { a = b;
+      b = seq[i+1];
+      if (a != b)
+        { for (j = i+2; j < len; j += 2)
+            if (a != seq[j] || b != seq[j+1])
+              break;
+          if (j-i >= MIN_SPAN)
+            { printf("Hit @%d: ",i);
+              Print_Seq(seq+i,j-i);
+              printf("\n");
+              if (lastr >= 0)
+                { printf("Extend from %d: ",lastr);
+                  Print_Seq(seq+lastl,lastr-lastl);
+                  printf(".");
+                  Print_Seq(seq+lastr,j-lastr);
+                  printf("\n");
+                  lastr += extend_right(seq+lastr,j-lastr,unit,2);
+                }
+              if (lastr > i+1)
+                lastr = j; 
+              else
+                { printf("\nReport %d-%d %c%c:   \n",lastl,lastr,dna[unit[0]],dna[unit[1]]);
+                  Print_Seq(seq+lastl,lastr-lastl);
+                  printf("\n\n");
+                  unit[0] = a;
+                  unit[1] = b;
+                  // i -= extend_left(seq+lastr,i-lastr,unit,2);
+                  lastl = i;
+                  lastr = j;
+                }
+	      i = j;
             }
-          e = f;
         }
+    }
+  if (lastr >= 0)
+    extend_right(seq+lastr,len-lastr,unit,2);
+*/
+
+
+  lastr = -1;
+  b = seq[0];
+  c = seq[1];
+  for (i = 0; i < len-MIN_SPAN; i++)
+    { a = b;
+      b = c;
+      c = seq[i+2];
+      if (a != b || a != c)
+        { for (j = i+3; j < len; j += 3)
+            if (a != seq[j] || b != seq[j+1] || c != seq[j+2])
+              break;
+          if (j-i >= MIN_SPAN)
+            { printf("Hit @%d: ",i);
+              Print_Seq(seq+i,j-i);
+              printf("\n");
+              if (lastr >= 0)
+                { printf("Extend from %d: ",lastr);
+                  Print_Seq(seq+lastl,lastr-lastl);
+                  printf(".");
+                  Print_Seq(seq+lastr,j-lastr);
+                  printf("\n");
+                  lastr += extend_right(seq+lastr,j-lastr,unit,3);
+                }
+              if (lastr > i+1)
+                lastr = j; 
+              else
+                { if (lastr >= 0)
+                    { printf("\nReport %d-%d %c%c%c:   \n",lastl,lastr,dna[unit[0]],dna[unit[1]],dna[unit[2]]);
+                      Print_Seq(seq+lastl,lastr-lastl);
+                      printf("\n\n");
+                    }
+                  unit[0] = a;
+                  unit[1] = b;
+                  unit[2] = c;
+                  // i -= extend_left3(seq+lastr,i-lastr,unit,3);
+                  lastl = i;
+                  lastr = j;
+                }
+	      i = j;
+            }
+        }
+    }
+  if (lastr >= 0)
+    extend_right(seq+lastr,len-lastr,unit,3);
+
+  // Write_Aln_Overlap(ofile,over);
+  // Compress_TraceTo8(over,0);
+  // Write_Aln_Trace(ofile,over->path.trace,over->path.tlen,t64,unit);
+
+/*
+  if (MAKE_MASK)
+    { if (mint >= MBUF_LEN)
+        { oneInt(mfile,0) = mscf;
+          oneWriteLine(mfile,'M',mint,mlist);
+          oneWriteLine(mfile,'L',mstr-mstring,mstring);
+          mint = 0;
+          mstr = mstring;
+        }
+      if (mint == 0)
+        mstr += sprintf(mstr,"%d",unit);
       else
-        e = f & 0x7fff;
+        mstr += sprintf(mstr,"\t%d",unit);
+      mlist[mint++] = path->bbpos + moff;
+      mlist[mint++] = path->aepos + moff;
     }
+*/
 
-  p = 0;                        //  turn diag counts into sort ptrs
-  for (i = 0; i < DIAG_MAX; i++)
-    { x = diags[i];
-      diags[i] = p;
-      p += x;
-    }
-
-#ifdef SORT2
-  printf("Sorted on Anti\n");
-  for (c = 0; c < p; c++)
-    printf(" %5d %5d\n",post[c].diag,post[c].ibeg); 
-#endif
-
-  for (i = 0; i < p; i++)       //  place ibeg/diag pairs in hits in order of diag then ibeg
-    { c = post[i].diag;
-      hits[diags[c]++] = post[i];
-    }
-
-#ifdef SHOW_SEEDS
-  p = 0;
-  for (i = 1; i < DIAG_MAX; i++)
-    { f = diags[i];
-      if (p >= e)
-        continue;
-      printf("Diagonal %d : %d\n",i,f);
-      for ( ; p < f; p++)
-        { d = hits[p].diag;
-          e = hits[p].ibeg;
-          printf("   %4d : %5d  ",d,e);
-          Print_Seq(seq+e,8);
-          printf("\n");
-        }
-    }
-#endif
-
-  { int   ncnt;
-    int   outhit, end, beg;
-    Chord *hist = (Chord *) post;
-    int   unit, wide, anti, last;
-    Path *path;
-
-    ncnt = 0;
-    p = diags[1];
-    for (i = 2; i < DIAG_MAX; i++)
-      { f = diags[i];
-        if (f-p > 1 && f-p > (i>>6))
-          { hist[ncnt].count = f-p;
-            hist[ncnt].diag  = i;
-            ncnt += 1;
-          }
-        p = f;
-      }
-
-    for (i = 0; i < 0x10000; i++)   //  Init counters for model subroutine
-      count[i] = 0;
-
-    qsort(hist,ncnt,sizeof(Chord),CSORT);
-
-#ifdef SHOW_SEARCH
-    printf("Histo: %d\n",ncnt);
-    for (i = 0; i < ncnt && i < 100; i++)
-      printf(" %4d: %5d\n",hist[i].diag,hist[i].count);
-#endif
-
-    outhit = 0;
-    for (i = 0; i < ncnt; i++)
-      { d = hist[i].diag;
-
-        last = -1;
-#ifdef SHOW_SEARCH
-        printf(" %4d: %5d\n",d,diags[d]-diags[d-1]);
-#endif
-        for (x = diags[d-1]+1; x < diags[d]; x++)
-          { p = hits[x].ibeg;
-#ifdef SHOW_SEARCH
-            printf("  p = %d (%d %d) %d\n",p,last,hits[x-1].ibeg,off);
-#endif
-            if (p < last || p - hits[x-1].ibeg > d || seq[p] >= 4 || seq[p+7] >= 4)
-              continue;
-
-            wide = .2*d;
-            if (wide < 1)
-              wide = 1;
-            anti = 2*(off + p) + d;
-            Local_Alignment(align,work,spec,d,d,anti,wide,wide);
-
-            path = align->path;
-#ifdef SHOW_SEARCH
-            printf("    %d (%d)  %d-%d-%d\n",path->aepos-path->bbpos,2*d,d-wide,d,d+wide);
-            printf(" Hit spans %d-%d (unit = %d)\n",path->bbpos,path->aepos,unit);
-#endif
-
-            end = path->aepos - off;
-            beg = path->bbpos - off;
-
-            if (beg > p || end <= p)
-              continue;
-            if (end > last)
-              last = end;
-            if (end-beg < 1.95*d)
-              continue;
-
-            unit = ave_tp_diag(path);
-
-            if (over->path.tlen > tmax)
-              { tmax = bundle->tmax = 1.2*over->path.tlen + 1000;
-                t64  = bundle->trace = realloc(t64,sizeof(int64)*tmax);
-              }
-            Write_Aln_Overlap(ofile,over);
-            Compress_TraceTo8(over,0);
-            Write_Aln_Trace(ofile,over->path.trace,over->path.tlen,t64,unit);
-
-            if (MAKE_MASK)
-              { if (mint >= MBUF_LEN)
-                  { oneInt(mfile,0) = mscf;
-                    oneWriteLine(mfile,'M',mint,mlist);
-                    oneWriteLine(mfile,'L',mstr-mstring,mstring);
-                    mint = 0;
-                    mstr = mstring;
-                  }
-                if (mint == 0)
-                  mstr += sprintf(mstr,"%d",unit);
-                else
-                  mstr += sprintf(mstr,"\t%d",unit);
-                mlist[mint++] = path->bbpos + moff;
-                mlist[mint++] = path->aepos + moff;
-              }
-
-#if defined(SHOW_ALIGNMENTS) || defined(DO_CUT)
-            Decompress_TraceTo16(over);
-            Compute_Trace_PTS(align,work,100,GREEDIEST,d-wide,d+wide);
-#endif
-
-#ifdef SHOW_ALIGNMENTS
-#ifndef SHOW_SEARCH
-            if (last < 0)
-              printf(" %4d: %5d\n",d,diags[d]-diags[d-1]);
-            printf("\n");
-#endif
-            printf(" Hit spans %d-%d (unit = %d)\n",path->bbpos,path->aepos,unit);
-            Print_Reference(stdout,align,work,8,100,10,0,10,0);
-#endif
-
-            if (path->bepos < path->abpos)
-              { for (f = (path->abpos-off); f < end; f++)
-                  seq[f] = 4;
-                end = path->bepos-off;
-                for (f = beg; f < end; f++)
-                  seq[f] = 4;
-
-#ifdef SHOW_ALIGNMENTS
-                printf("  Near Tandem len = %d gap = %d\n",
-                       path->aepos-path->bbpos,path->abpos-path->bepos);
-#endif
-              }
-            else
-              { for (f = beg; f < end; f++)
-                  seq[f] = 4;
-              }
-
-            if (path->aepos > outhit)
-              outhit = path->aepos;
-          }
-      }
-
-    bundle->mint = mint;
-    bundle->mstr = mstr;
-
-    return (outhit);
-  }
+  bundle->mint = mint;
+  bundle->mstr = mstr;
 }
 
 
@@ -481,8 +443,7 @@ static void *compress_thread(void *args)
 { S_Bundle *bundle = (S_Bundle *) args;
   uint8    *buffer = bundle->buffer;
   GDB      *gdb    = bundle->gdb;
-  int       last, clen;
-  int       i, p;
+  int       i, clen;
  
   i = bundle->over->aread;
 
@@ -501,19 +462,7 @@ static void *compress_thread(void *args)
   bundle->mscf = gdb->contigs[i].scaf;
   bundle->moff = gdb->contigs[i].sbeg;
 
-  last = -1;
-  if (clen < 0x8000)
-    spectrum_block(buffer,0,clen,bundle);
-  else
-    for (p = 0; p+0x2000 <= clen; p += 0x6000)
-      { if (p+0x8000 > clen)
-          spectrum_block(buffer+p,p,clen-p,bundle);
-        else
-          { last = spectrum_block(buffer+p,p,0x8000,bundle);
-            if (last >= p+0x6000)
-              p = last-0x6000;
-          }
-      }
+  micro_contig(buffer,clen,bundle);
 
   if (bundle->mint > 0)
     { oneInt(bundle->mfile,0) = bundle->mscf;
@@ -546,7 +495,6 @@ int main(int argc, char *argv[])
   OneSchema *anoSchema;
 
   (void) Print_Seq;
-  (void) emer;
 
   //   Process command line
 
@@ -680,6 +628,8 @@ int main(int argc, char *argv[])
           }
       }
 
+    Compute_Terminators();
+
     Tstack = tstack;
     for (i = 0; i < NTHREADS; i++)
       Tstack[i] = i;
@@ -716,6 +666,8 @@ int main(int argc, char *argv[])
           }
 
         pthread_create(threads+tid,NULL,compress_thread,parm+tid);
+
+        break;
       }
 
 #ifndef DEBUG_THREADS
