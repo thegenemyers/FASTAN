@@ -102,7 +102,7 @@ typedef struct _ANO ANO;
   //  Read or create a temporary GDB (if the source is a fasta) for the source file found at
   //     either <source> or <cpath>/<source>.  If num_bps > 0 then return an array of num_bps
   //     FILE pointers to the .bps file for the database (necessary as the .bps is already
-  //     unlinked at when creating a temporary GDB).  If num_bps > 1 then it is the responsibility
+  //     unlinked when creating a temporary GDB).  If num_bps > 1 then it is the responsibility
   //     of the caller to free this array after closing all the units save for the first.
   //     The first FILE pointer is shared with the GDB and so will be closed when the GDB
   //     is closed.  If ano is not NULL, then if the GDB is created from a fasta and it has

@@ -30,12 +30,15 @@
 #undef   SHOW_SEARCH
 #undef   SHOW_ALIGNMENTS
 
+#define DIAG_MAX        30000
+#define DIAG_MIN            2
+#define BLOCK_OVERLAP  0x6000
+
 #define TSPACE     100
 #define VERSION  "0.5"
-#define DIAG_MAX 30000
 #define MBUF_LEN   200  //  Must be even
 
-static char *Usage = "[-vM] [-T(8)] <source:path>[<fa_extn>|<1_extn>] <target>[.1aln]";
+static char *Usage = "[-vM] [-T(8)] <source:path>[<fa_extn>|<1_extn>|.1gdb] <target>[.1aln]";
 
 static int NTHREADS;
 static int VERBOSE;
@@ -326,8 +329,8 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
     Path *path;
 
     ncnt = 0;
-    p = diags[1];
-    for (i = 2; i < DIAG_MAX; i++)
+    p = diags[DIAG_MIN-1];
+    for (i = DIAG_MIN; i < DIAG_MAX; i++)
       { f = diags[i];
         if (f-p > 1 && f-p > (i>>6))
           { hist[ncnt].count = f-p;
@@ -505,13 +508,15 @@ static void *compress_thread(void *args)
   if (clen < 0x8000)
     spectrum_block(buffer,0,clen,bundle);
   else
-    for (p = 0; p+0x2000 <= clen; p += 0x6000)
-      { if (p+0x8000 > clen)
-          spectrum_block(buffer+p,p,clen-p,bundle);
+    for (p = 0; p < clen; p += BLOCK_OVERLAP)
+      { if (p+0x8000 >= clen)
+          { spectrum_block(buffer+p,p,clen-p,bundle);
+            break;
+          }
         else
           { last = spectrum_block(buffer+p,p,0x8000,bundle);
-            if (last >= p+0x6000)
-              p = last-0x6000;
+            if (last >= p+BLOCK_OVERLAP)
+              p = last-BLOCK_OVERLAP;
           }
       }
 
@@ -746,6 +751,8 @@ int main(int argc, char *argv[])
         free(parm[i].block);
         if (i == 0)
           Free_Align_Spec(parm[i].spec);
+        else
+          fclose(_gdb.seqs);
         Free_Work_Data(parm[i].work);
       }
 
@@ -755,6 +762,8 @@ int main(int argc, char *argv[])
       }
     oneFileClose(Ofile);
 
+    if (NTHREADS > 1)
+      free(units);
     Close_GDB(gdb);
 
     if (VERBOSE)

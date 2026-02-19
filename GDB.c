@@ -1497,7 +1497,7 @@ int Load_Sequences(GDB *gdb, int stype)
               EXIT(1);
             }
         }
-      Uncompress_Read(len,seq+off);
+      Uncompress_Read(len,seq+off,0);
       if (stype > NUMERIC)
         translate(seq+off);
       c[i].boff = off;
@@ -1761,7 +1761,7 @@ char *Get_Contig(GDB *gdb, int i, int stype, char *buffer)
     { if (gdb->seqstate == COMPRESSED)
         { memcpy(buffer,m + off,COMPRESSED_LEN(len));
           if (stype >= NUMERIC)
-            Uncompress_Read(len,buffer);
+            Uncompress_Read(len,buffer,0);
           if (stype == LOWER_CASE)
             Lower_Read(buffer);
           else if (stype == UPPER_CASE)
@@ -1811,7 +1811,7 @@ char *Get_Contig(GDB *gdb, int i, int stype, char *buffer)
   if (stype == COMPRESSED)
     return (buffer);
 
-  Uncompress_Read(len,buffer);
+  Uncompress_Read(len,buffer,0);
   if (stype == NUMERIC)
     buffer[-1] = 4;
   else if (stype == LOWER_CASE)
@@ -1867,16 +1867,14 @@ char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffe
   if (gdb->seqstate != EXTERNAL)
     { if (gdb->seqstate == COMPRESSED)
         { memcpy(buffer,m + off,clen);
-          Uncompress_Read(len,buffer);
-          buffer += beg%4;
-          buffer[len] = 4;
+          Uncompress_Read(len,buffer,beg);
           if (stype == LOWER_CASE)
             Lower_Read(buffer);
           else if (stype == UPPER_CASE)
             Upper_Read(buffer);
         }
       else
-        { memcpy(buffer,m + off + (beg%4),len+1);
+        { memcpy(buffer,m + off + beg,len);
           buffer[len] = '\0';
           if (stype != gdb->seqstate)
             { if (stype == NUMERIC)
@@ -1911,9 +1909,7 @@ char *Get_Contig_Piece(GDB *gdb, int i, int beg, int end, int stype, char *buffe
           EXIT(NULL);
         }
     }
-  Uncompress_Read(4*clen,buffer);
-  buffer += beg%4;
-  buffer[len] = 4;
+  Uncompress_Read(len,buffer,beg);
   if (stype == NUMERIC)
     buffer[-1] = 4;
   else if (stype == LOWER_CASE)
