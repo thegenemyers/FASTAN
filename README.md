@@ -15,17 +15,19 @@ will be found here.
 ## FasTAN Reference
 
 ```
-FasTAN <source:path>[<precursor] <target:path>[.1aln]
+FasTAN [-vM] [-T(8)] <source:path>[<fa_extn>|<1_extn>|.1gdb] <target>[.1aln]
                   
-    <precursor> = .1gdb | <fa_extn> | <1_extn>
-    
-    <fa_extn> = (.fa|.fna|.fasta)[.gz]
-    <1_extn>  = any valid 1-code sequence file type
+           <fa_extn> = (.fa|.fna|.fasta)[.gz]
+           <1_extn>  = any valid 1-code sequence file type
+
+      -v: Verbose mode, output statistics as proceed.
+      -T: Number of threads to use.
+      -M: Make a .1ano mask of the hits found.
 ```
 
 FasTAN takes a FASTA or 1GDB as input and outputs the off-diagonal alignment delimiting
 tandem repeats and their period as a .1aln file.
-For details on a .1aln file and how to convert it to PAF or PSL format, see
-the repo [FASTGA](www.github.com/thegenemyers/FASTGA).  For a program **tanbed** for
-converting the .1aln to a BED-file with the period see
-Richard Durbin's [alntools](www.github.com/richarddurbin/alntools).
+If the -M option is set then FasTAN further produces a .1ano file with the same root as
+the .1aln file, that contains the intervals spanned by the alignments.
+For details on a .1aln and .1ano files and how to convert the former to PAF or PSL format, see
+the repo [FASTGA](www.github.com/thegenemyers/FASTGA).
