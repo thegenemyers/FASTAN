@@ -30,4 +30,4 @@ tandem repeats and their period as a .1aln file.
 If the -M option is set then FasTAN further produces a .1ano file with the same root as
 the .1aln file, that contains the intervals spanned by the alignments.
 For details on a .1aln and .1ano files and how to convert the former to PAF or PSL format, see
-the repo [FASTGA](www.github.com/thegenemyers/FASTGA).
+the repo [FASTGA](https://www.github.com/thegenemyers/FASTGA).
