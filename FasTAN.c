@@ -505,10 +505,10 @@ static void *compress_thread(void *args)
   bundle->moff = gdb->contigs[i].sbeg;
 
   last = -1;
-  if (clen < 0x8000)
+  if (clen <= 0x8000)
     spectrum_block(buffer,0,clen,bundle);
   else
-    for (p = 0; p < clen; p += BLOCK_OVERLAP)
+    for (p = 0; p+7 < clen; p += BLOCK_OVERLAP)
       { if (p+0x8000 >= clen)
           { spectrum_block(buffer+p,p,clen-p,bundle);
             break;
