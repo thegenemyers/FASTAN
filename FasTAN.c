@@ -752,7 +752,7 @@ int main(int argc, char *argv[])
         if (i == 0)
           Free_Align_Spec(parm[i].spec);
         else
-          fclose(_gdb.seqs);
+          fclose(parm[i]._gdb.seqs);
         Free_Work_Data(parm[i].work);
       }
 
