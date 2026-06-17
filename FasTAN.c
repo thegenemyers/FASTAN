@@ -434,7 +434,7 @@ static int64 *bitvec_partition(uint8 *seq, int *len, uint8 *pat, int patlen, int
                   tmid = bloc + unit;
                   tlow = tmid - var;
                   thgh = tmid + var;
-  
+
                   oest = pest;
                   oloc = ploc;
                   pest = best;
