@@ -889,7 +889,7 @@ static int spectrum_block(uint8 *seq, int off, int len, S_Bundle *bundle)
 
                 oneInt(mfile,0) = mscf;
                 oneInt(mfile,1) = path->bbpos + moff;
-                oneInt(mfile,2) = path->bepos + moff;
+                oneInt(mfile,2) = path->aepos + moff;
                 oneWriteLine(mfile,'M',0,NULL);
                 mlen = sprintf(mstring,"%d",unit);
                 oneWriteLine(mfile,'L',mlen,mstring);
