@@ -1,4 +1,9 @@
 # FasTAN: A Fast Tandem Repeat Finder  
+
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/fastan/README.html)
+[![Anaconda-Server Badge](https://anaconda.org/bioconda/fastan/badges/version.svg)](https://anaconda.org/bioconda/fastan)
+[![Anaconda-Server Badge](https://anaconda.org/bioconda/fastan/badges/downloads.svg)](https://anaconda.org/bioconda/fastan)
+
 <font size ="4">**_Author:  Gene Myers_**<br>
 **_First:   Sept 30, 2025_**<br>
 **_Release v0.8: April 25, 2026_**<br>
